@@ -1,0 +1,761 @@
+// SafiriConnect — Online Bus Ticketing System
+// Data model. Provider is SQLite for zero-config development; switch `provider`
+// to "postgresql" and re-run `prisma db push` for production — no model changes
+// are required, every construct used here is portable.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Identity & access control
+// ---------------------------------------------------------------------------
+
+/// Roles are checked server-side on every mutation. PASSENGER is the default for
+/// self-registration; STAFF and ADMIN can only be created by an existing ADMIN.
+/// Two planes of authority. SafiriConnect is a marketplace, not a bus company:
+/// platform roles govern who may trade, operator roles govern one company's own
+/// fleet, timetable and money. A role's plane decides whether `User.operatorId`
+/// is set — see the invariant documented on User.
+enum Role {
+  /// Platform. Runs SafiriConnect itself; unscoped.
+  SUPER_ADMIN
+  /// Platform. Customer care across operators — reads bookings, cannot configure.
+  PLATFORM_SUPPORT
+  /// Operator. Runs one transport company.
+  COMPANY_ADMIN
+  /// Operator. Timetable, fleet and crew; no fares, no money, no staff.
+  ROUTE_MANAGER
+  /// Operator. Money only. Deliberately cannot modify the bookings it reconciles.
+  FINANCE_OFFICER
+  /// Operator. Counter sales and gate boarding.
+  BOOKING_STAFF
+  /// Operator. Assigned trips only: manifest and scanning.
+  CONDUCTOR
+  /// Operator. Assigned trips only: passenger count, never names.
+  DRIVER
+  /// Platform. Books and travels; owns nothing operational.
+  PASSENGER
+}
+
+model User {
+  id           String  @id @default(cuid())
+  email        String  @unique
+  phone        String  @unique
+  fullName     String
+  /// bcrypt hash, cost 12. Never selected into API responses.
+  passwordHash String
+  role         Role    @default(PASSENGER)
+  nationalId   String?
+  avatarUrl    String?
+
+  /// Which company this user works for.
+  ///
+  /// The invariant, enforced in `lib/scope.ts` because SQL cannot express it:
+  /// operator roles MUST have one, platform roles and passengers MUST NOT.
+  /// Every staff-facing query filters on it, which is what stops one company
+  /// reading another's bookings, revenue or fleet.
+  operatorId String?
+  operator   Operator? @relation("OperatorStaff", fields: [operatorId], references: [id])
+
+  invitedById String?
+  invitedAt   DateTime?
+  lastSeenAt  DateTime?
+
+  isActive      Boolean   @default(true)
+  emailVerified Boolean   @default(false)
+  /// Set after N consecutive failed logins; cleared on success.
+  lockedUntil   DateTime?
+  failedLogins  Int       @default(0)
+  lastLoginAt   DateTime?
+
+  bookings         Booking[]
+  sessions         Session[]
+  auditLogs        AuditLog[]
+  notifications    Notification[]
+  /// Trips this user is assigned to drive.
+  drivenTrips      Trip[]         @relation("TripDriver")
+  conductedTrips   Trip[]         @relation("TripConductor")
+  ownedOperator    Operator?      @relation("OperatorOwner")
+  counterBookings  Booking[]      @relation("BookingClerk")
+  refundsRequested Refund[]       @relation("RefundRequester")
+  refundsReviewed  Refund[]       @relation("RefundReviewer")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([role])
+  @@index([createdAt])
+  @@index([operatorId, role])
+}
+
+/// Refresh-token store. Enables real logout and "sign out everywhere" — a bare
+/// JWT cannot be revoked, so the session row is the revocation list.
+model Session {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// SHA-256 of the refresh token; the raw token never touches the database.
+  tokenHash String    @unique
+  userAgent String?
+  ipAddress String?
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// ---------------------------------------------------------------------------
+// Fleet & network
+// ---------------------------------------------------------------------------
+
+enum BusStatus {
+  ACTIVE
+  MAINTENANCE
+  RETIRED
+}
+
+/// Seat layout is stored as a template on the bus so that seat maps render
+/// identically for every trip the bus runs.
+/// A bus company. SafiriConnect sells tickets for several operators rather than
+/// running a single fleet, which is how Kenyan ticketing actually works — a
+/// passenger compares companies on the same corridor and chooses.
+model Operator {
+  id       String  @id @default(cuid())
+  name     String  @unique
+  /// Short code on manifests and liveries, e.g. "EZC".
+  code     String  @unique
+  /// Brand colour for the chip shown in search results.
+  colour   String  @default("#0d7a5f")
+  /// Passenger rating out of 5.
+  rating   Float   @default(4.0)
+  tagline  String?
+  isActive Boolean @default(true)
+
+  /// Where the company sits in the onboarding workflow. A company can only
+  /// trade — have its trips appear in search — once APPROVED.
+  status         OperatorStatus @default(APPROVED)
+  /// Platform commission on gross ticket value, e.g. 0.08 for 8%.
+  commissionRate Float          @default(0.08)
+  contactEmail   String?
+  contactPhone   String?
+
+  /// The COMPANY_ADMIN who owns this account. Set when the application is
+  /// approved and the first administrator is created.
+  ownerId         String?   @unique
+  owner           User?     @relation("OperatorOwner", fields: [ownerId], references: [id])
+  appliedAt       DateTime?
+  approvedAt      DateTime?
+  approvedBy      String?
+  rejectionReason String?
+
+  buses     Bus[]
+  staff     User[]             @relation("OperatorStaff")
+  corridors OperatorRoute[]
+  schedules ScheduleTemplate[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isActive])
+  @@index([status])
+}
+
+enum OperatorStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  SUSPENDED
+}
+
+/// Which corridors a company serves, and what it charges on each.
+///
+/// Routes are platform infrastructure — Nairobi–Mombasa is a corridor six
+/// companies run, not any one company's property — so the operator attaches to
+/// the route rather than owning it. The fare lives here because pricing is a
+/// commercial decision each company makes for itself; `Route.baseFare` is only
+/// a market reference used for estimation and sanity checks.
+model OperatorRoute {
+  id         String   @id @default(cuid())
+  operatorId String
+  operator   Operator @relation(fields: [operatorId], references: [id], onDelete: Cascade)
+  routeId    String
+  route      Route    @relation(fields: [routeId], references: [id], onDelete: Cascade)
+  baseFare   Int
+  isActive   Boolean  @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([operatorId, routeId])
+  @@index([routeId, isActive])
+}
+
+/// A recurring timetable entry, from which real departures are generated.
+///
+/// Operators do not schedule departures one at a time — they run the 07:00 to
+/// Mombasa every weekday. Storing the pattern rather than the instances is what
+/// lets an administrator change Monday's departure time once instead of forty
+/// times, and it is what generates the rolling horizon of trips that search and
+/// the availability calendar read.
+model ScheduleTemplate {
+  id          String   @id @default(cuid())
+  operatorId  String
+  operator    Operator @relation(fields: [operatorId], references: [id], onDelete: Cascade)
+  routeId     String
+  route       Route    @relation(fields: [routeId], references: [id], onDelete: Cascade)
+  busId       String?
+  bus         Bus?     @relation(fields: [busId], references: [id])
+  driverId    String?
+  conductorId String?
+
+  /// JSON array of weekday numbers, 0 = Sunday. "[1,2,3,4,5]" is weekdays.
+  daysOfWeek    String
+  /// Kenyan wall-clock departure, "HH:mm". Converted to UTC per generated date.
+  departureTime String
+  fare          Int
+  validFrom     DateTime
+  validTo       DateTime?
+  isActive      Boolean   @default(true)
+
+  trips Trip[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([operatorId, isActive])
+  @@index([routeId])
+}
+
+model Bus {
+  id               String       @id @default(cuid())
+  registration     String       @unique
+  /// Which company operates this vehicle.
+  operatorId       String?
+  operator         Operator?    @relation(fields: [operatorId], references: [id])
+  model            String
+  capacity         Int
+  /// Seats per row excluding the aisle, e.g. 4 => "2 + aisle + 2".
+  seatsPerRow      Int          @default(4)
+  /// Column index (0-based) after which the aisle is drawn.
+  aisleAfter       Int          @default(2)
+  hasWifi          Boolean      @default(false)
+  hasChargingPorts Boolean      @default(false)
+  hasToilet        Boolean      @default(false)
+  hasAirCon        Boolean      @default(true)
+  status           BusStatus    @default(ACTIVE)
+  /// Service tier of this vehicle; multiplies the route's base fare.
+  vehicleClass     VehicleClass @default(ECONOMY)
+
+  /// Drives the maintenance-due event so a bus is pulled before it fails.
+  nextServiceDueAt DateTime?
+  odometerKm       Int       @default(0)
+
+  trips     Trip[]
+  schedules ScheduleTemplate[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([operatorId, status])
+}
+
+/// What kind of place a Location is. Drives grouping in the search autocomplete
+/// and lets the network be browsed by county.
+enum LocationType {
+  COUNTY
+  CITY
+  TOWN
+  TERMINAL
+  BORDER
+  AIRPORT
+}
+
+/// Searchable catalogue of every place the network can serve: Kenya's 47
+/// counties and their major towns, named bus terminals, border posts, and
+/// international destinations across East Africa.
+///
+/// Routes carry foreign keys to this table for integrity, and *also* keep the
+/// place names denormalised on the Route row. The duplication is deliberate:
+/// almost every query in the app reads a route's endpoints for display, and
+/// paying for a two-table join on the hot search path to re-derive a string
+/// that never changes is not a good trade.
+model Location {
+  id        String       @id @default(cuid())
+  name      String
+  type      LocationType @default(TOWN)
+  /// Kenyan county this place sits in; null for international locations.
+  county    String?
+  /// ISO 3166-1 alpha-2. KE, TZ, UG, RW, BI, SS.
+  country   String       @default("KE")
+  /// Coordinates, for future map rendering and distance estimation.
+  latitude  Float?
+  longitude Float?
+  /// Alternative spellings and local names, JSON array — so "Mombasa" is found
+  /// by typing "Mombaza" and Nairobi's terminus by "Machakos Country Bus".
+  aliases   String       @default("[]")
+  isActive  Boolean      @default(true)
+
+  routesFrom Route[] @relation("RouteOrigin")
+  routesTo   Route[] @relation("RouteDestination")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// Two towns may share a name across countries (e.g. a Kenyan and Ugandan
+  /// Busia), so the name alone is not unique.
+  @@unique([name, country])
+  @@index([type])
+  @@index([county])
+  @@index([country])
+  @@index([isActive])
+}
+
+model Route {
+  id          String @id @default(cuid())
+  origin      String
+  destination String
+
+  originId            String?
+  originLocation      Location? @relation("RouteOrigin", fields: [originId], references: [id])
+  destinationId       String?
+  destinationLocation Location? @relation("RouteDestination", fields: [destinationId], references: [id])
+
+  /// Kilometres — used to derive fare-per-km analytics and to estimate a fare
+  /// for a new route when the operator has not set one.
+  distanceKm  Int
+  /// Scheduled journey duration in minutes.
+  durationMin Int
+  /// Ordered intermediate stops, JSON array of strings.
+  stops       String @default("[]")
+
+  /// Market economy fare in KES for this corridor. This is the anchor for all
+  /// pricing: a trip's fare is derived from it, never invented. Seeded with
+  /// real-world rates rather than computed, because Kenyan fares are set by
+  /// competition on each corridor and are not a clean function of distance.
+  baseFare Int
+
+  /// True when the route crosses an international border — drives the customs
+  /// surcharge and the longer boarding advice shown to passengers.
+  isInternational Boolean @default(false)
+
+  isActive Boolean @default(true)
+
+  trips       Trip[]
+  fareHistory FareHistory[]
+  /// Operators that sell on this corridor, each with its own fare.
+  operators   OperatorRoute[]
+  schedules   ScheduleTemplate[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// A route is uniquely identified by its endpoints; prevents duplicate
+  /// "Nairobi -> Kisumu" rows drifting apart with different fares.
+  @@unique([origin, destination])
+  @@index([isActive])
+  @@index([isInternational])
+  @@index([origin])
+  @@index([destination])
+}
+
+/// Service tier. Multiplies the route's base fare — the same seat on the same
+/// corridor legitimately costs more on an executive coach than on a stage bus.
+enum VehicleClass {
+  ECONOMY
+  VIP
+  EXECUTIVE
+}
+
+/// An operator-configurable pricing adjustment: weekend loading, festive-season
+/// surcharge, or a promotional discount. Kept as data rather than code so fares
+/// can be tuned from the admin screens without a redeploy.
+model FareRule {
+  id         String       @id @default(cuid())
+  name       String
+  kind       FareRuleKind
+  /// 1.15 adds 15%; 0.9 takes 10% off. Applied multiplicatively after class.
+  multiplier Float
+  /// Optional window. A rule with no dates applies whenever its kind matches.
+  startsAt   DateTime?
+  endsAt     DateTime?
+  /// For WEEKEND rules: JSON array of weekday numbers (0 = Sunday).
+  daysOfWeek String       @default("[]")
+  /// Restrict to one route; null applies network-wide.
+  routeId    String?
+  isActive   Boolean      @default(true)
+  priority   Int          @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([kind, isActive])
+  @@index([routeId])
+}
+
+enum FareRuleKind {
+  WEEKEND
+  PEAK_SEASON
+  PUBLIC_HOLIDAY
+  PROMOTION
+  OFF_PEAK
+}
+
+/// Append-only record of every fare change, so an operator can answer "why did
+/// this route cost more last month?" and examiners can see the audit path.
+model FareHistory {
+  id        String   @id @default(cuid())
+  routeId   String
+  route     Route    @relation(fields: [routeId], references: [id], onDelete: Cascade)
+  oldFare   Int
+  newFare   Int
+  reason    String?
+  changedBy String?
+  createdAt DateTime @default(now())
+
+  @@index([routeId, createdAt])
+}
+
+enum TripStatus {
+  SCHEDULED
+  BOARDING
+  DEPARTED
+  ARRIVED
+  CANCELLED
+}
+
+/// A Trip is one bus running one route at one departure time. It is the unit
+/// passengers actually book against.
+model Trip {
+  id          String  @id @default(cuid())
+  routeId     String
+  route       Route   @relation(fields: [routeId], references: [id])
+  busId       String
+  bus         Bus     @relation(fields: [busId], references: [id])
+  driverId    String?
+  driver      User?   @relation("TripDriver", fields: [driverId], references: [id])
+  conductorId String?
+  conductor   User?   @relation("TripConductor", fields: [conductorId], references: [id])
+
+  scheduleTemplateId String?
+  scheduleTemplate   ScheduleTemplate? @relation(fields: [scheduleTemplateId], references: [id], onDelete: SetNull)
+
+  /// What actually happened, as reported by the driver.
+  ///
+  /// Until these are set, every arrival time the platform shows is a scheduled
+  /// guess. `TripStatus` has had DEPARTED and ARRIVED since the first schema
+  /// and nothing ever set them; punctuality reporting is impossible without a
+  /// record of the real times.
+  actualDepartureAt DateTime?
+  actualArrivalAt   DateTime?
+
+  departureAt DateTime
+  arrivalAt   DateTime
+  /// Fare in KES. Integer cents are unnecessary — KES has no practical subunit
+  /// in transport pricing — but stored as Int to avoid float rounding.
+  fare        Int
+  status      TripStatus @default(SCHEDULED)
+  /// Denormalised counter kept in sync inside the booking transaction so seat
+  /// availability can be listed without aggregating Booking rows.
+  seatsBooked Int        @default(0)
+
+  bookings Booking[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([departureAt])
+  @@index([status])
+  @@index([routeId, departureAt])
+  /// The search path filters on status and orders by departure together.
+  /// SQLite uses one index per table per query, so two single-column indexes
+  /// left it scanning; this composite covers both halves of the hot query.
+  @@index([status, departureAt])
+  /// Availability aggregation joins trips to their bus and groups by day.
+  @@index([busId, departureAt])
+  /// Crew dashboards ask "what am I working today" on every load.
+  @@index([driverId, departureAt])
+  @@index([conductorId, departureAt])
+}
+
+// ---------------------------------------------------------------------------
+// Booking & payment
+// ---------------------------------------------------------------------------
+
+enum BookingStatus {
+  /// Seats held, payment not yet confirmed. Expires after HOLD_MINUTES.
+  PENDING
+  CONFIRMED
+  CANCELLED
+  /// Hold elapsed without payment; seats returned to the pool.
+  EXPIRED
+  /// Ticket scanned at boarding.
+  CHECKED_IN
+  COMPLETED
+}
+
+model Booking {
+  id        String        @id @default(cuid())
+  /// Human-facing reference, e.g. "SC-7F3K9Q". Unique, shown on the ticket.
+  reference String        @unique
+  userId    String
+  user      User          @relation(fields: [userId], references: [id])
+  tripId    String
+  trip      Trip          @relation(fields: [tripId], references: [id])
+  status    BookingStatus @default(PENDING)
+
+  /// Total payable in KES = sum of seat fares. Snapshotted at booking time so a
+  /// later fare change never rewrites history.
+  totalAmount Int
+  /// Moment the PENDING hold lapses.
+  holdsUntil  DateTime
+
+  seats    BookingSeat[]
+  payments Payment[]
+  ticket   Ticket?
+
+  /// How the sale was made. Counter sales are attributed to the clerk so a till
+  /// can be reconciled at the end of a shift.
+  channel          BookingChannel @default(ONLINE)
+  createdByStaffId String?
+  createdByStaff   User?          @relation("BookingClerk", fields: [createdByStaffId], references: [id])
+
+  refunds Refund[]
+
+  cancelledAt  DateTime?
+  cancelReason String?
+  /// Refund owed on cancellation, per the sliding-scale policy in lib/policy.ts.
+  refundAmount Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, createdAt])
+  @@index([tripId])
+  @@index([status])
+  @@index([holdsUntil])
+  @@index([createdByStaffId, createdAt])
+}
+
+enum BookingChannel {
+  ONLINE
+  COUNTER
+  AGENT
+}
+
+/// One row per seat per booking. The composite unique on (tripId, seatNumber) is
+/// the double-booking guard — it makes the race condition a database error
+/// rather than a business-logic bug.
+model BookingSeat {
+  id         String  @id @default(cuid())
+  bookingId  String
+  booking    Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  /// Duplicated from the booking so the unique constraint below can exist.
+  tripId     String
+  seatNumber String
+
+  passengerName  String
+  passengerPhone String
+  passengerIdNo  String?
+
+  /// Boarding is per seat, not per booking. A family books four seats and three
+  /// turn up; the manifest has to be able to say which.
+  boardedAt DateTime?
+  boardedBy String?
+  noShow    Boolean   @default(false)
+
+  @@unique([tripId, seatNumber])
+  @@index([bookingId])
+}
+
+enum PaymentMethod {
+  MPESA
+  CARD
+  CASH
+}
+
+enum PaymentKind {
+  CHARGE
+  REFUND
+}
+
+enum PaymentStatus {
+  INITIATED
+  PENDING
+  SUCCESS
+  FAILED
+  REFUNDED
+}
+
+/// Simulated M-Pesa STK-push. The shape mirrors Safaricom Daraja's real
+/// callback contract so swapping the simulator for the live API is a change of
+/// one adapter, not of the schema.
+model Payment {
+  id                String        @id @default(cuid())
+  bookingId         String
+  booking           Booking       @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  method            PaymentMethod @default(MPESA)
+  status            PaymentStatus @default(INITIATED)
+  /// Direction of the movement. A refund is a negative-going transaction of its
+  /// own, not a status flip on the original charge — flipping the charge to
+  /// REFUNDED erased the fact that money was ever collected.
+  kind              PaymentKind   @default(CHARGE)
+  amount            Int
+  phone             String?
+  /// Daraja's CheckoutRequestID equivalent — our handle on the pending push.
+  checkoutRequestId String?       @unique
+  /// Daraja's MpesaReceiptNumber equivalent, e.g. "SC12AB34CD".
+  receiptNumber     String?       @unique
+  failureReason     String?
+
+  createdAt   DateTime  @default(now())
+  completedAt DateTime?
+
+  @@index([bookingId])
+  @@index([status])
+}
+
+/// A refund as a financial transaction with its own approval and settlement.
+///
+/// Previously the refund amount was written to `Booking.refundAmount` and no
+/// money movement was ever recorded, so cancelled value silently stayed in
+/// revenue. A refund is something that is requested, reviewed and settled — it
+/// has states and dates, which a single integer column cannot carry.
+model Refund {
+  id        String       @id @default(cuid())
+  bookingId String
+  booking   Booking      @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  /// The charge being reversed, so settlement can pay back the same instrument.
+  paymentId String?
+  amount    Int
+  /// Share of the fare returned, per the sliding-scale policy. 100 for an
+  /// operator-side cancellation, where the passenger is not at fault.
+  percent   Int
+  reason    String?
+  status    RefundStatus @default(REQUESTED)
+
+  requestedById String?
+  requestedBy   User?    @relation("RefundRequester", fields: [requestedById], references: [id])
+  requestedAt   DateTime @default(now())
+
+  reviewedById String?
+  reviewedBy   User?     @relation("RefundReviewer", fields: [reviewedById], references: [id])
+  reviewedAt   DateTime?
+  reviewNote   String?
+
+  settledAt DateTime?
+
+  @@index([status, requestedAt])
+  @@index([bookingId])
+}
+
+enum RefundStatus {
+  REQUESTED
+  APPROVED
+  REJECTED
+  SETTLED
+}
+
+model Ticket {
+  id          String    @id @default(cuid())
+  bookingId   String    @unique
+  booking     Booking   @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  /// Opaque token encoded into the QR code and verified at the gate. Distinct
+  /// from the booking reference so a shoulder-surfed reference cannot be used
+  /// to forge a boarding pass.
+  qrToken     String    @unique
+
+  /// Human-readable verification code, e.g. "SC-2026-8F4K92". The primary way a
+  /// clerk verifies a ticket — short enough to read off a receipt and type,
+  /// unlike the 32-character QR token. Random over an unambiguous alphabet so it
+  /// is unique and not guessable from a neighbouring code. Nullable only so the
+  /// column can be added to a populated database; every issued ticket has one,
+  /// and existing rows were backfilled.
+  verificationCode String? @unique
+
+  issuedAt    DateTime  @default(now())
+
+  /// The verify step, distinct from boarding: a clerk confirms the ticket is
+  /// valid and ready to board. Recorded so "who verified, and when" can be
+  /// answered, and so a second verify is caught as a duplicate.
+  verifiedAt  DateTime?
+  verifiedBy  String?
+
+  /// The boarding step: the passenger is on the bus.
+  checkedInAt DateTime?
+  checkedInBy String?
+
+  @@index([verifiedAt])
+  @@index([checkedInAt])
+}
+
+// ---------------------------------------------------------------------------
+// Operations: audit, notifications, settings
+// ---------------------------------------------------------------------------
+
+/// Append-only. Written for every state-changing action; never updated or
+/// deleted through application code.
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action     String
+  entity     String
+  entityId   String?
+  /// Lets a COMPANY_ADMIN read their own company's history without exposing
+  /// the platform-wide trail, which only SUPER_ADMIN may see.
+  operatorId String?
+  /// JSON blob of the change. Sensitive fields are redacted before writing.
+  metadata   String?
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  @@index([userId])
+  @@index([entity, entityId])
+  @@index([createdAt])
+  @@index([operatorId, createdAt])
+}
+
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+  SMS
+}
+
+model Notification {
+  id        String              @id @default(cuid())
+  userId    String
+  user      User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  channel   NotificationChannel @default(IN_APP)
+  /// What kind of thing happened, so the bell can be filtered and digests can
+  /// be assembled per category rather than as one undifferentiated stream.
+  category  String              @default("general")
+  /// Groups messages the digest should collapse into one, e.g. "booking:2026-07-20".
+  groupKey  String?
+  title     String
+  body      String
+  /// Deep link into the app, e.g. "/bookings/abc123".
+  link      String?
+  readAt    DateTime?
+  createdAt DateTime            @default(now())
+
+  @@index([userId, readAt])
+  @@index([userId, createdAt])
+}
+
+/// Key/value store for operator-tunable settings so that fare policy, hold
+/// duration and company details are editable without a redeploy.
+model Setting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}

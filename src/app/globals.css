@@ -1,0 +1,182 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/**
+ * Theme tokens. Both themes are defined here as HSL triplets so Tailwind's
+ * `<alpha-value>` syntax works, and so switching theme is a single class on
+ * <html> rather than a `dark:` variant on every element in the app.
+ */
+@layer base {
+  :root {
+    /* Cool slate neutrals — a near-white canvas with a faint violet cast, so
+       the indigo brand sits on a surface of the same temperature rather than
+       fighting a warm or green-tinted grey. */
+    --bg: 240 24% 98%;
+    --surface: 0 0% 100%;
+    --elevated: 240 30% 99%;
+    --line: 240 16% 90%;
+    --ink: 240 26% 13%;
+    --muted: 240 9% 46%;
+
+    /* Indigo-violet primary. Carries the product's identity across the nav,
+       primary actions and charts; the soft tint backs chips and quiet fills,
+       and the ink shade is for brand-coloured text on those tints. */
+    --brand: 250 78% 63%;
+    --brand-soft: 250 90% 96%;
+    --brand-ink: 250 60% 48%;
+
+    /* Warm amber, kept as the one secondary — attention states, boarding, a
+       selected seat — so the interface is not entirely one hue. */
+    --accent: 32 92% 52%;
+
+    /* Semantic, deliberately not the brand: green still means paid, available
+       and success the world over, whatever colour the product wears. */
+    --ok: 152 58% 40%;
+    --warn: 38 92% 48%;
+    --danger: 352 78% 56%;
+
+    --shadow: 245 45% 22%;
+
+    --font-sans: var(--font-jakarta), ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace;
+  }
+
+  .dark {
+    /* Deep cool slate — an indigo-black rather than a neutral one, so the
+       violet brand glows against it instead of sitting on flat charcoal. */
+    --bg: 244 30% 8%;
+    --surface: 243 26% 11%;
+    --elevated: 243 22% 14%;
+    --line: 243 16% 22%;
+    --ink: 240 22% 95%;
+    --muted: 240 12% 66%;
+
+    --brand: 250 88% 74%;
+    --brand-soft: 250 42% 22%;
+    --brand-ink: 250 85% 86%;
+
+    --accent: 36 94% 62%;
+
+    --ok: 152 52% 52%;
+    --warn: 40 90% 58%;
+    --danger: 352 80% 66%;
+
+    --shadow: 244 70% 2%;
+  }
+
+  * {
+    @apply border-line;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-bg text-ink antialiased;
+    font-family: var(--font-sans);
+    /* Tabular figures keep fare columns and seat counts aligned in tables. */
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Visible, consistent focus ring — keyboard users should never have to guess
+     where they are. Applied via :focus-visible so mouse clicks stay clean. */
+  :focus-visible {
+    @apply outline-none ring-2 ring-brand ring-offset-2 ring-offset-bg;
+  }
+
+  ::selection {
+    @apply bg-brand/20;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply rounded-full bg-line;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-muted/40;
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-card border border-line bg-surface shadow-card;
+  }
+
+  .input {
+    @apply w-full rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink
+           placeholder:text-muted/70 transition
+           focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/25;
+  }
+
+  .label {
+    @apply mb-1.5 block text-xs font-semibold uppercase tracking-wide text-muted;
+  }
+
+  .btn {
+    @apply inline-flex select-none items-center justify-center gap-2 rounded-lg px-4 py-2
+           text-sm font-semibold transition active:scale-[0.98]
+           disabled:pointer-events-none disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply btn bg-brand text-white shadow-brand transition
+           hover:-translate-y-px hover:bg-brand/90 hover:shadow-lift active:translate-y-0;
+  }
+  .btn-secondary {
+    @apply btn border border-line bg-surface text-ink hover:bg-elevated;
+  }
+  .btn-ghost {
+    @apply btn text-muted hover:bg-elevated hover:text-ink;
+  }
+  .btn-danger {
+    @apply btn bg-danger text-white hover:bg-danger/90;
+  }
+
+  .badge {
+    @apply inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-semibold;
+  }
+
+  /* Skeleton shimmer for loading states. */
+  .skeleton {
+    @apply relative overflow-hidden rounded-md bg-line/60;
+  }
+  .skeleton::after {
+    @apply absolute inset-0 animate-shimmer;
+    content: "";
+    background: linear-gradient(
+      90deg,
+      transparent,
+      hsl(var(--surface) / 0.6),
+      transparent
+    );
+  }
+
+  /* Subtle topographic texture for hero sections — gives the marketing surface
+     depth without shipping an image request. */
+  .hero-grid {
+    background-image:
+      radial-gradient(circle at 1px 1px, hsl(var(--brand) / 0.16) 1px, transparent 0);
+    background-size: 28px 28px;
+  }
+}
+
+@layer utilities {
+  /* Respect users who have asked the OS to reduce motion. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
